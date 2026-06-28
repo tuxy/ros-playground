@@ -4,8 +4,6 @@
 
 #include "geometry_msgs/msg/pose2_d.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/string.hpp"
-#include "warehouse_pkg/msg/id_pose2_d.hpp"
 #include "warehouse_pkg/srv/get_bay_number.hpp"
 
 using namespace std::chrono_literals;
@@ -19,14 +17,13 @@ public:
     std::string serial = this->get_parameter("serial").as_string();
 
     publisher_ =
-        this->create_publisher<warehouse_pkg::msg::IDPose2D>("robot_pose", 10);
+        this->create_publisher<geometry_msgs::msg::Pose2D>("robot_pose", 10);
     auto timer_callback = [this]() -> void {
-      auto message = warehouse_pkg::msg::IDPose2D();
-      message.id = bay_number_;
-      message.pose.x = 0.0f;
-      message.pose.y = count_++;
-      RCLCPP_INFO(this->get_logger(), "Publishing pose {%lf %lf} with id %ld",
-                  message.pose.x, message.pose.y, message.id);
+      auto message = geometry_msgs::msg::Pose2D();
+      message.x = 0.0f;
+      message.y = count_++;
+      RCLCPP_INFO(this->get_logger(), "Publishing pose {%lf %lf}", message.x,
+                  message.y);
       this->publisher_->publish(message);
     };
     RCLCPP_INFO(this->get_logger(),
@@ -37,7 +34,7 @@ public:
 
 private:
   rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::Publisher<warehouse_pkg::msg::IDPose2D>::SharedPtr publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::Pose2D>::SharedPtr publisher_;
   size_t count_;
   int bay_number_;
 };
