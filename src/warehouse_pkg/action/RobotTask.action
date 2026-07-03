@@ -1,0 +1,8 @@
+geometry_msgs/Pose2D goal
+---
+bool success
+geometry_msgs/Pose2D final
+uint8 status
+---
+float32 distance_left
+geometry_msgs/Pose2D current
