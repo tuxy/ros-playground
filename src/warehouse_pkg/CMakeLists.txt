@@ -11,13 +11,16 @@ find_package(ament_cmake REQUIRED)
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
         "msg/IDPose2D.msg"
+        "msg/RobotStatusMonitor.msg"
         "srv/GetBayNumber.srv"
+        "action/RobotTask.action"
         DEPENDENCIES
         geometry_msgs
 )
@@ -26,7 +29,7 @@ rosidl_get_typesupport_target(cpp_typesupport_target "${PROJECT_NAME}" "rosidl_t
 
 add_executable(robot_navigator src/robot_navigator.cpp)
 target_include_directories(robot_navigator PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp)
-target_link_libraries(robot_navigator PUBLIC rclcpp::rclcpp ${std_msgs_TARGETS} ${geometry_msgs_TARGETS} ${cpp_typesupport_target})
+target_link_libraries(robot_navigator PUBLIC rclcpp::rclcpp rclcpp_action::rclcpp_action ${std_msgs_TARGETS} ${geometry_msgs_TARGETS} ${cpp_typesupport_target})
 
 add_executable(telemetry_monitor src/telemetry_monitor.cpp)
 target_include_directories(telemetry_monitor PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp)
