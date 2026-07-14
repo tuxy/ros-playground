@@ -18,11 +18,5 @@ def generate_launch_description():
         ) for serial in robot_serials
     ]
 
-    monitor_node = Node(
-        package='warehouse_pkg',
-        executable='telemetry_monitor',
-        name='telemetry_monitor_node',
-        parameters=[{'robots': robot_serials}]
-    )
-    launch_items = robot_nodes + [fleet_manager, monitor_node]
+    launch_items = robot_nodes + [fleet_manager]
     return LaunchDescription(launch_items)

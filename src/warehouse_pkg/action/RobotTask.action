@@ -5,4 +5,5 @@ geometry_msgs/Pose2D final
 uint8 status
 ---
 float32 distance_left
-geometry_msgs/Pose2D current
+geometry_msgs/Pose2D current_pos
+float32 current_heading
