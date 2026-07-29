@@ -88,6 +88,18 @@ public:
 
     qDet_ = detNet->out.createOutputQueue(4, false);
     qPreview_ = detNet->passthrough.createOutputQueue(4, false);
+    qDepth_ = detNet->passthroughDepth.createOutputQueue(4, false);
+
+    // Camera intrinsics for ArUco host-side depth back-projection
+    auto calib = device_->readCalibration();
+    auto intrinsics = calib.getCameraIntrinsics(
+        dai::CameraBoardSocket::CAM_A, 640, 640);
+    fx_ = intrinsics[0][0];
+    fy_ = intrinsics[1][1];
+    cx_ = intrinsics[0][2];
+    cy_ = intrinsics[1][2];
+    RCLCPP_INFO(get_logger(), "Intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+                fx_, fy_, cx_, cy_);
 
     pipeline_->start();
     RCLCPP_INFO(get_logger(), "Pipeline started");
@@ -142,6 +154,11 @@ public:
       std::vector<std::vector<cv::Point2f>> corners;
       cv::aruco::detectMarkers(frame, dict, corners, ids, params);
 
+      // Depth map aligned to RGB (RAW16 uint16_t, mm, 0 = invalid)
+      cv::Mat depthMat;
+      auto inDepth = qDepth_->tryGet<dai::ImgFrame>();
+      if (inDepth) depthMat = inDepth->getFrame();
+
       if (!ids.empty()) {
         aruco_msgs::msg::MarkerArray aruco_array;
         aruco_array.header.stamp = stamp;
@@ -151,10 +168,18 @@ public:
           aruco_msgs::msg::Marker marker;
           marker.header = aruco_array.header;
           marker.id = ids[i];
-          marker.pose.pose.position.x =
-              (corners[i][0].x + corners[i][2].x) / 2.0;
-          marker.pose.pose.position.y =
-              (corners[i][0].y + corners[i][2].y) / 2.0;
+
+          float u = (corners[i][0].x + corners[i][2].x) / 2.0f;
+          float v = (corners[i][0].y + corners[i][2].y) / 2.0f;
+          float z_mm = lookup_depth(depthMat, u, v);
+
+          if (z_mm > 0) {
+            // Back-project pixel + depth → 3D (camera optical frame)
+            marker.pose.pose.position.x = (u - cx_) * z_mm / fx_ * 0.001f;
+            marker.pose.pose.position.y = (v - cy_) * z_mm / fy_ * 0.001f;
+            marker.pose.pose.position.z = z_mm * 0.001f;
+          }
+
           aruco_array.markers.push_back(marker);
         }
         pub_aruco_->publish(aruco_array);
@@ -162,17 +187,34 @@ public:
 
       // OpenCV Window for visualisation
       if (debug_) {
-        debug_frame(frame, inDet, ids, corners);
+        debug_frame(frame, inDet, ids, corners, depthMat);
       }
 
       rclcpp::spin_some(shared_from_this());
     }
   }
 
+  float lookup_depth(const cv::Mat &depth, float u, float v) {
+    if (depth.empty()) return 0;
+    int px = static_cast<int>(u), py = static_cast<int>(v);
+    int half = 2;  // 5x5 window
+    uint32_t sum = 0, count = 0;
+    for (int dy = -half; dy <= half; dy++) {
+      for (int dx = -half; dx <= half; dx++) {
+        int x = px + dx, y = py + dy;
+        if (x < 0 || x >= depth.cols || y < 0 || y >= depth.rows) continue;
+        uint16_t z = depth.at<uint16_t>(y, x);
+        if (z > 0) { sum += z; count++; }
+      }
+    }
+    return count > 0 ? static_cast<float>(sum) / count : 0;
+  }
+
   void debug_frame(cv::Mat &frame,
                    const std::shared_ptr<dai::SpatialImgDetections> &inDet,
                    const std::vector<int> &ids,
-                   const std::vector<std::vector<cv::Point2f>> &corners) {
+                   const std::vector<std::vector<cv::Point2f>> &corners,
+                   const cv::Mat &depthMat) {
     // NOTE that this section here is also useful later on if a hybrid approach
     // is preferred:
     //  - The NN cube detection runs on device
@@ -215,9 +257,19 @@ public:
                   0.4, cv::Scalar(0, 0, 0), 1);
     }
 
-    // Draw Aruco markers
+    // Draw Aruco markers + depth labels
     if (!ids.empty()) {
       cv::aruco::drawDetectedMarkers(frame, corners, ids);
+      for (size_t i = 0; i < ids.size(); i++) {
+        float u = (corners[i][0].x + corners[i][2].x) / 2.0f;
+        float v = (corners[i][0].y + corners[i][2].y) / 2.0f;
+        float z_mm = lookup_depth(depthMat, u, v);
+        float z_m = z_mm * 0.001f;
+        std::string label = "ID=" + std::to_string(ids[i]) +
+            " Z=" + std::to_string(z_m).substr(0, 4) + "m";
+        cv::putText(frame, label, cv::Point(u, v - 10),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 255), 1);
+      }
     }
 
     cv::imshow("debug window", frame);
@@ -247,6 +299,8 @@ private:
   std::unique_ptr<dai::Pipeline> pipeline_;
   std::shared_ptr<dai::MessageQueue> qPreview_;
   std::shared_ptr<dai::MessageQueue> qDet_;
+  std::shared_ptr<dai::MessageQueue> qDepth_;
+  float fx_ = 0, fy_ = 0, cx_ = 0, cy_ = 0;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_cubes_;
   rclcpp::Publisher<aruco_msgs::msg::MarkerArray>::SharedPtr pub_aruco_;
 };
