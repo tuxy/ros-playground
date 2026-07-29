@@ -19,6 +19,24 @@
 #include <string>
 #include <vector>
 
+// # Model notes
+// To develop a model, utilise the luxonis hub for the least pain and convert to
+// shaves = 6 with legacy = on. Not sure why, but the default modern version
+// seems to work less well, and requires shaves <= 7 for models on the camera to
+// work. Nonetheless, the performance is impressive with only aruco detection
+// (fast) and maybe hsv filtering on the host-side, whilst the heavy cube
+// detection is offloaded to the camera. If needed, camera/rgb information can
+// be ommited as to increase the available bandwidth for streaming data. Either
+// use the 640x640 (default) model for longer range accuracy, or the 416x416
+// model (_416) for much lower latency and higher inference FPS.
+//
+// # Transform publisher
+// Right now, aruco detections are being published as a MarkerArray, and cube
+// detections as PoseStamped. In the future, for highly accurate position
+// estimation in the global map, both can publish transforms to /tf, so the
+// accuracy/measurement is tied to the slam/odom provided. Aruco markers have
+// ids though, so not really sure how to deal with that if using transforms.
+
 class CubeDetectorNode : public rclcpp::Node {
 public:
   CubeDetectorNode() : Node("cube_aruco_detector") {
@@ -107,11 +125,13 @@ public:
         // Leave quaternion to default / none
         pose.pose.orientation.w = 1.0;
 
-        pub_cubes_->publish(pose);
+        if (pose.pose.position.z != 0.0) {
+          pub_cubes_->publish(pose);
+        }
 
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-                             "Cube %d (%.2f): x=%.3f y=%.3f z=%.3f m",
-                             det.label, det.confidence, pose.pose.position.x,
+                             "Cube detected (%.2f): x=%.3f y=%.3f z=%.3f m",
+                             det.confidence, pose.pose.position.x,
                              pose.pose.position.y, pose.pose.position.z);
       }
 
@@ -153,7 +173,8 @@ public:
                    const std::shared_ptr<dai::SpatialImgDetections> &inDet,
                    const std::vector<int> &ids,
                    const std::vector<std::vector<cv::Point2f>> &corners) {
-    // NOTE that this is also useful later on if a hybrid approach is preferred:
+    // NOTE that this section here is also useful later on if a hybrid approach
+    // is preferred:
     //  - The NN cube detection runs on device
     //  - Color + confidence confirmation runs on host
     const std::array<const char *, 5> class_names = {
@@ -172,14 +193,18 @@ public:
 
       const char *name =
           (det.label < class_names.size()) ? class_names[det.label] : "unknown";
-      float z_m = det.spatialCoordinates.z * scale;
+      float x = det.spatialCoordinates.x * scale;
+      float y = det.spatialCoordinates.y * scale;
+      float z = det.spatialCoordinates.z * scale;
 
       cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2),
                     cv::Scalar(0, 255, 0), 2);
       std::string label =
           std::string(name) + " " +
           std::to_string(static_cast<int>(det.confidence * 100)) +
-          "% Z=" + std::to_string(z_m).substr(0, 4) + "m";
+          " % X =" + std::to_string(x).substr(0, 4) + "m" +
+          " % Y =" + std::to_string(y).substr(0, 4) + "m" +
+          " % Z =" + std::to_string(z).substr(0, 4) + "m";
       int baseline = 0;
       cv::Size text_sz =
           cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseline);
@@ -202,10 +227,12 @@ public:
 private:
   std::string resolve_model_path() {
     auto param_path = get_parameter("model_path").as_string();
+    // Param as the priority
     if (!param_path.empty() && std::filesystem::exists(param_path))
       return param_path;
     std::vector<std::string> candidates = {
-        "/ros_ws/src/aruco_detector_cpp/models/best.rvc2.tar.xz",
+        "/ros_ws/src/aruco_detector_cpp/models/"
+        "best_416.rvc2_legacy.rvc2.tar.xz",
         "models/best.rvc2.tar.xz",
     };
     for (auto &p : candidates) {
