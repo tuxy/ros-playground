@@ -1,378 +1,274 @@
-#include "aruco_msgs/msg/marker_array.hpp"
-#include "depthai/device/Device.hpp"
+#include "shared.cpp" // pulls in shared helpers + all deps
+
+#include "ament_index_cpp/get_package_share_directory.hpp"
 #include "depthai/nn_archive/NNArchive.hpp"
-#include "depthai/pipeline/MessageQueue.hpp"
-#include "depthai/pipeline/Pipeline.hpp"
 #include "depthai/pipeline/datatype/ImgFrame.hpp"
 #include "depthai/pipeline/datatype/SpatialImgDetections.hpp"
-#include "depthai/pipeline/node/Camera.hpp"
 #include "depthai/pipeline/node/SpatialDetectionNetwork.hpp"
-#include "depthai/pipeline/node/StereoDepth.hpp"
-#include "geometry_msgs/msg/pose_stamped.hpp"
-#include "rclcpp/rclcpp.hpp"
-#include "tf2_ros/transform_broadcaster.h"
-#include <opencv2/aruco.hpp>
+
 #include <opencv2/highgui.hpp>
 
-#include <algorithm>
-#include <cmath>
 #include <filesystem>
-#include <iomanip>
 #include <memory>
-#include <sstream>
+#include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
-// # Model notes
-// To develop a model, utilise the luxonis hub for the least pain and convert to
-// shaves = 6 with legacy = on. Not sure why, but the default modern version
-// seems to work less well, and requires shaves <= 7 for models on the camera to
-// work. Nonetheless, the performance is impressive with only aruco detection
-// (fast) and maybe hsv filtering on the host-side.
-//
-// # Transform publisher
-// Both cube detections and aruco markers broadcast dynamic transforms to /tf.
-// Cube det frames: <color>_cube (e.g. red_cube)
-// Aruco det frames: aruco_marker_<id>
-// Parent frame is world (default) for testing. When the camera pose is
-// available in tf, global positions can be determined (from SLAM/odom) when
-// parent changed.
+static const std::string WINDOW_NAME = "OAKD-LR NN Output";
 
-class CubeDetectorNode : public rclcpp::Node {
+class DetectorNode : public DetectorBase {
 public:
-  CubeDetectorNode() : Node("cube_aruco_detector") {
+  DetectorNode()
+      : DetectorBase("detector_node",
+                     DetectorBaseDefaults{"world",
+                                          "oak_rgb_camera_optical_frame",
+                                          "/oakd", false}) {
     declare_parameter("model_path", "");
-    declare_parameter("parent_tf", "world");
-    declare_parameter("conf_threshold", 0.6); // Use ~0.6 due to clear classes
-    declare_parameter("debug", false);
+    declare_parameter("conf_threshold", 0.6);
+    declare_parameter("rgb_fps", 15.0);
+    declare_parameter("class_names", std::vector<std::string>{
+                                         "red_cube", "green_cube", "blue_cube",
+                                         "yellow_cube", "gray_cube"});
 
-    // Might not need pub class due to tf transforms.
-    pub_cubes_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-        "/oakd/detections", 10);
-    pub_aruco_ = this->create_publisher<aruco_msgs::msg::MarkerArray>(
-        "/oakd/markers", 10);
-
-    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-
-    debug_ = get_parameter("debug").as_bool();
-    parent_tf_ = get_parameter("parent_tf").as_string();
     conf_threshold_ = get_parameter("conf_threshold").as_double();
+    rgb_fps_ = static_cast<float>(get_parameter("rgb_fps").as_double());
+    class_names_ = get_parameter("class_names").as_string_array();
+    model_path_ = get_parameter("model_path").as_string();
   }
 
-  ~CubeDetectorNode() override {
-    if (spinner_thread_.joinable()) {
-      spinner_thread_.join();
-    }
-  }
-
-  void setup() {
-    std::string model_path = resolve_model_path();
-    RCLCPP_INFO(get_logger(), "Loading model: %s", model_path.c_str());
-
-    if (!std::filesystem::exists(model_path)) {
-      RCLCPP_ERROR(get_logger(), "Model not found: %s", model_path.c_str());
-      throw std::runtime_error("Model file not found");
+  void initialise() {
+    std::string resolved = resolveModelPath();
+    RCLCPP_INFO(get_logger(), "Loading model: %s", resolved.c_str());
+    if (!std::filesystem::exists(resolved)) {
+      throw std::runtime_error("Model not found: " + resolved);
     }
 
     device_ = std::make_shared<dai::Device>();
+    pipeline_ = std::make_shared<dai::Pipeline>(device_);
     RCLCPP_INFO(get_logger(), "Device: %s", device_->getDeviceName().c_str());
 
-    pipeline_ = std::make_unique<dai::Pipeline>(device_);
+    PipelineConfig cfg;
+    cfg.rgb_fps = rgb_fps_;
+    cfg.intrinsics_width = cfg.intrinsics_height = 416;
+    cfg.stereo_width = 640;
+    cfg.stereo_height = 400;
+    pipeline_helper_.build(pipeline_, device_, cfg);
 
-    // Setup RGB camera for vision/NN (CAM_A)
-    auto rgbCam = pipeline_->create<dai::node::Camera>()->build(
-        dai::CameraBoardSocket::CAM_A);
-
-    // Setup stereo cameras for depth
-    auto monoLeft = pipeline_->create<dai::node::Camera>()->build(
-        dai::CameraBoardSocket::CAM_B);
-    auto monoRight = pipeline_->create<dai::node::Camera>()->build(
-        dai::CameraBoardSocket::CAM_C);
-
-    auto stereo = pipeline_->create<dai::node::StereoDepth>();
-    stereo->build(*monoLeft->requestOutput({640, 400}),
-                  *monoRight->requestOutput({640, 400}));
-    stereo->setDepthAlign(dai::CameraBoardSocket::CAM_A);
-
-    auto nnArchive = dai::NNArchive(model_path);
-
-    // SpatialDetectionNetwork handles depth calculations (only for cubes)
+    auto nn = dai::NNArchive(resolved);
     auto detNet = pipeline_->create<dai::node::SpatialDetectionNetwork>();
-    detNet->build(rgbCam, stereo, nnArchive);
+    detNet->build(pipeline_helper_.rgbCam(), pipeline_helper_.stereo(), nn);
 
     detection_queue_ = detNet->out.createOutputQueue(4, false);
     preview_queue_ = detNet->passthrough.createOutputQueue(4, false);
     depth_queue_ = detNet->passthroughDepth.createOutputQueue(4, false);
 
-    // Camera intrinsics for Aruco host-side depth back-projection
-    auto calib = device_->readCalibration();
-    auto intrinsics =
-        calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, 416, 416);
-    fx_ = intrinsics[0][0];
-    fy_ = intrinsics[1][1];
-    cx_ = intrinsics[0][2];
-    cy_ = intrinsics[1][2];
-    RCLCPP_INFO(get_logger(), "Intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
-                fx_, fy_, cx_, cy_);
+    auto intr = pipeline_helper_.readRgbIntrinsics();
+    fx_ = intr.fx;
+    fy_ = intr.fy;
+    cx_ = intr.cx;
+    cy_ = intr.cy;
 
-    // Pre-build ArUco detector objects (reused each frame)
-    aruco_dict_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
-    aruco_params_ = cv::aruco::DetectorParameters::create();
-
+    // Only touch the GUI when debugging, so headless runs don't fail
+    if (debug()) {
+      cv::namedWindow(WINDOW_NAME, cv::WINDOW_NORMAL);
+    }
     pipeline_->start();
     RCLCPP_INFO(get_logger(), "Pipeline started");
-
-    // Background executor thread for ROS callbacks
-    spinner_thread_ =
-        std::thread([this]() { rclcpp::spin(shared_from_this()); });
   }
 
-  void spin() {
+  void run() {
     RCLCPP_INFO(get_logger(), "Spin loop starting");
 
     while (rclcpp::ok()) {
-      auto in_det = detection_queue_->get<dai::SpatialImgDetections>();
-      auto in_frame = preview_queue_->get<dai::ImgFrame>();
-      if (!in_det|| !in_frame
+      auto det = detection_queue_->tryGet<dai::SpatialImgDetections>();
+      auto frame = preview_queue_->tryGet<dai::ImgFrame>();
+      if (!det || !frame)
         continue;
 
-      auto stamp = now();
-      const std::string frame_id = "oak_rgb_camera_optical_frame";
+      auto depth = depth_queue_->tryGet<dai::ImgFrame>();
+      cv::Mat depth_mat = depth ? depth->getFrame() : cv::Mat{};
+      const auto stamp = now();
+      cv::Mat cv_frame = frame->getCvFrame();
 
-      // NN cube detections with depth
-      for (auto &det : in_det->detections) {
-        if (det.confidence < conf_threshold_)
+      std::vector<geometry_msgs::msg::TransformStamped> tf_batch;
+
+      for (auto &d : det->detections) {
+        if (d.confidence < conf_threshold_)
           continue;
 
-        geometry_msgs::msg::PoseStamped pose;
-        pose.header.stamp = stamp;
-        pose.header.frame_id = frame_id;
+        const float scale =
+            (det->unit == dai::LengthUnit::MILLIMETER) ? 0.001f : 1.0f;
+        geometry_msgs::msg::Point p;
+        p.x = d.spatialCoordinates.x * scale;
+        p.y = d.spatialCoordinates.y * scale;
+        p.z = d.spatialCoordinates.z * scale;
 
-        float scale =
-            (in_det->unit == dai::LengthUnit::MILLIMETER) ? 0.001f : 1.0f;
-        pose.pose.position.x = det.spatialCoordinates.x * scale;
-        pose.pose.position.y = det.spatialCoordinates.y * scale;
-        pose.pose.position.z = det.spatialCoordinates.z * scale;
-        pose.pose.orientation.w = 1.0;
+        if (!std::isfinite(p.z) || p.z <= 0.0f)
+          continue;
 
-        if (std::isfinite(pose.pose.position.z) && pose.pose.position.z > 0.0) {
-          pub_cubes_->publish(pose);
+        pub_cubes_->publish(makePoseStamped(stamp, p));
 
-          const char *frame_name =
-              (static_cast<uint32_t>(det.label) < class_names.size())
-                  ? class_names[det.label]
-                  : "unknown class";
-          publish_tf(parent_tf_, frame_name, stamp, pose.pose.position,
-                     pose.pose.orientation);
-        }
+        const std::string frame_name =
+            (static_cast<size_t>(d.label) < class_names_.size())
+                ? class_names_[d.label]
+                : "unknown_class";
+        geometry_msgs::msg::Quaternion q;
+        q.w = 1.0;
+        publishTf(frame_name, stamp, p, q); // one at a time is fine here
 
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-                             "Cube detected (%.2f): x=%.3f y=%.3f z=%.3f m",
-                             det.confidence, pose.pose.position.x,
-                             pose.pose.position.y, pose.pose.position.z);
+                             "Cube %s (%.2f): x=%.3f y=%.3f z=%.3f m",
+                             frame_name.c_str(), d.confidence, p.x, p.y, p.z);
       }
 
-      // Host-based Aruco detection
-      cv::Mat frame = in_frame->getCvFrame();
-
+      // Aruco detection
       std::vector<int> ids;
       std::vector<std::vector<cv::Point2f>> corners;
-      cv::aruco::detectMarkers(frame, aruco_dict_, corners, ids, aruco_params_);
+      aruco_.detect(cv_frame, ids, corners);
 
-      // Depth map: non-blocking get; may lag a frame behind the preview
-      auto inDepth = depth_queue_->get<dai::ImgFrame>();
-      cv::Mat depthMat;
-      if (inDepth) {
-        depthMat = inDepth->getFrame();
-      }
+      std::vector<DepthSample> samples(ids.size());
+      aruco_msgs::msg::MarkerArray arr;
+      arr.header.stamp = stamp;
+      arr.header.frame_id = frameId();
 
-      if (!ids.empty()) {
-        aruco_msgs::msg::MarkerArray aruco_array;
-        aruco_array.header.stamp = stamp;
-        aruco_array.header.frame_id = frame_id;
-
-        for (size_t i = 0; i < ids.size(); i++) {
-          aruco_msgs::msg::Marker marker;
-          marker.header = aruco_array.header;
-          marker.id = ids[i];
-
-          float u = (corners[i][0].x + corners[i][2].x) / 2.0f;
-          float v = (corners[i][0].y + corners[i][2].y) / 2.0f;
-          float z_mm = lookup_depth(depthMat, u, v);
-
-          if (z_mm > 0) {
-            marker.pose.pose.position.x = (u - cx_) * z_mm / fx_ * 0.001f;
-            marker.pose.pose.position.y = (v - cy_) * z_mm / fy_ * 0.001f;
-            marker.pose.pose.position.z = z_mm * 0.001f;
-            marker.pose.pose.orientation.w = 1.0;
-
-            publish_tf(parent_tf_, "aruco_marker_" + std::to_string(ids[i]),
-                       stamp, marker.pose.pose.position,
-                       marker.pose.pose.orientation);
-          }
-
-          // Only publish markers with valid depth
-          if (z_mm > 0) {
-            aruco_array.markers.push_back(marker);
-          }
-        }
-        pub_aruco_->publish(aruco_array);
-      }
-
-      // Debug visualization
-      if (debug_) {
-        debug_frame(frame, in_det, ids, corners, depthMat);
-      }
-    }
-
-    // Wait for the background executor thread to wind down
-    if (spinner_thread_.joinable()) {
-      spinner_thread_.join();
-    }
-  }
-
-  void publish_tf(const std::string &parent, const std::string &child,
-                  const builtin_interfaces::msg::Time &stamp,
-                  const geometry_msgs::msg::Point &pos,
-                  const geometry_msgs::msg::Quaternion &orient) {
-    geometry_msgs::msg::TransformStamped t;
-    t.header.stamp = stamp;
-    t.header.frame_id = parent;
-    t.child_frame_id = child;
-    t.transform.translation.x = pos.x;
-    t.transform.translation.y = pos.y;
-    t.transform.translation.z = pos.z;
-    t.transform.rotation = orient;
-    tf_broadcaster_->sendTransform(t);
-  }
-
-  float lookup_depth(const cv::Mat &depth, float u, float v) {
-    if (depth.empty())
-      return 0;
-    int px = static_cast<int>(u), py = static_cast<int>(v);
-    int half = 2; // 5x5 window
-    uint32_t sum = 0, count = 0;
-    for (int dy = -half; dy <= half; dy++) {
-      for (int dx = -half; dx <= half; dx++) {
-        int x = px + dx, y = py + dy;
-        if (x < 0 || x >= depth.cols || y < 0 || y >= depth.rows)
+      for (size_t i = 0; i < ids.size(); ++i) {
+        const auto c = ArUcoDetector::centroid(corners[i]);
+        const auto s =
+            aruco_.sampleDepth(depth_mat, c.x, c.y, fx_, fy_, cx_, cy_);
+        samples[i] = s;
+        if (!s.valid)
           continue;
-        uint16_t z = depth.at<uint16_t>(y, x);
-        if (z > 0) {
-          sum += z;
-          count++;
-        }
+
+        aruco_msgs::msg::Marker marker;
+        marker.header = arr.header;
+        marker.id = ids[i];
+        marker.pose.pose.position.x = s.x_m;
+        marker.pose.pose.position.y = s.y_m;
+        marker.pose.pose.position.z = s.z_m;
+        marker.pose.pose.orientation.w = 1.0;
+        arr.markers.push_back(marker);
+
+        geometry_msgs::msg::TransformStamped t;
+        t.header.stamp = stamp;
+        t.header.frame_id = parentTf();
+        t.child_frame_id = "aruco_marker_" + std::to_string(ids[i]);
+        t.transform.translation.x = s.x_m;
+        t.transform.translation.y = s.y_m;
+        t.transform.translation.z = s.z_m;
+        t.transform.rotation.w = 1.0;
+        tf_batch.push_back(t);
+      }
+
+      if (!arr.markers.empty())
+        pub_aruco_->publish(arr);
+      publishTfBatch(tf_batch);
+
+      if (debug()) {
+        debugOverlay(cv_frame, *det, ids, corners, samples);
       }
     }
-    return count > 0 ? static_cast<float>(sum) / count : 0;
   }
 
-  void debug_frame(cv::Mat &frame,
-                   const std::shared_ptr<dai::SpatialImgDetections> &in_det,
-                   const std::vector<int> &ids,
-                   const std::vector<std::vector<cv::Point2f>> &corners,
-                   const cv::Mat &depthMat) {
+private:
+  std::string resolveModelPath() {
+    if (!model_path_.empty() && std::filesystem::exists(model_path_))
+      return model_path_;
 
-    float scale = (in_det->unit == dai::LengthUnit::MILLIMETER) ? 0.001f : 1.0f;
-    int w = frame.cols;
-    int h = frame.rows;
+    // Prefer the package share directory.
+    try {
+      auto pkg =
+          ament_index_cpp::get_package_share_directory("aruco_detector_cpp");
+      auto p = pkg + "/models/" + "last.rvc2_legacy.rvc2.tar.xz";
+      return p;
+    } catch (const std::exception &e) {
+      RCLCPP_WARN(get_logger(), "can't find model in share: %s", e.what());
+    }
+    return model_path_;
+  }
 
-    // Draw cube detections: bounding box + label + depth
-    for (auto &det : in_det->detections) {
-      int x1 = std::max(0, static_cast<int>(det.xmin * w));
-      int y1 = std::max(0, static_cast<int>(det.ymin * h));
-      int x2 = std::min(w, static_cast<int>(det.xmax * w));
-      int y2 = std::min(h, static_cast<int>(det.ymax * h));
+  void debugOverlay(cv::Mat &frame, const dai::SpatialImgDetections &dets,
+                    const std::vector<int> &ids,
+                    const std::vector<std::vector<cv::Point2f>> &corners,
+                    const std::vector<DepthSample> &samples) {
+    const float scale =
+        (dets.unit == dai::LengthUnit::MILLIMETER) ? 0.001f : 1.0f;
+    const int w = frame.cols, h = frame.rows;
 
-      const char *name = (static_cast<uint32_t>(det.label) < class_names.size())
-                             ? class_names[det.label]
-                             : "unknown class";
-      float x = det.spatialCoordinates.x * scale;
-      float y = det.spatialCoordinates.y * scale;
-      float z = det.spatialCoordinates.z * scale;
+    for (const auto &d : dets.detections) {
+      if (d.confidence < conf_threshold_)
+        continue;
+
+      const int x1 = std::max(0, static_cast<int>(d.xmin * w));
+      const int y1 = std::max(0, static_cast<int>(d.ymin * h));
+      const int x2 = std::min(w, static_cast<int>(d.xmax * w));
+      const int y2 = std::min(h, static_cast<int>(d.ymax * h));
+
+      const std::string name =
+          (static_cast<size_t>(d.label) < class_names_.size())
+              ? class_names_[d.label]
+              : "unknown_class";
+      const float x = d.spatialCoordinates.x * scale;
+      const float y = d.spatialCoordinates.y * scale;
+      const float z = d.spatialCoordinates.z * scale;
 
       cv::rectangle(frame, cv::Point(x1, y1), cv::Point(x2, y2),
                     cv::Scalar(0, 255, 0), 2);
       std::string label =
-          std::string(name) + " " +
-          std::to_string(static_cast<int>(det.confidence * 100)) +
-          " % X =" + x + "m" + " % Y =" + y + "m" + " % Z =" + z + "m";
+          name + " " + std::to_string(static_cast<int>(d.confidence * 100)) +
+          "% X=" + std::to_string(x) + "m Y=" + std::to_string(y) +
+          "m Z=" + std::to_string(z) + "m";
       int baseline = 0;
-      cv::Size text_sz =
+      cv::Size sz =
           cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.4, 1, &baseline);
-      cv::rectangle(frame, cv::Point(x1, y1 - text_sz.height - 4),
-                    cv::Point(x1 + text_sz.width, y1), cv::Scalar(0, 255, 0),
+      cv::rectangle(frame, cv::Point(x1, y1 - sz.height - 4),
+                    cv::Point(x1 + sz.width, y1), cv::Scalar(0, 255, 0),
                     cv::FILLED);
       cv::putText(frame, label, cv::Point(x1, y1 - 2), cv::FONT_HERSHEY_SIMPLEX,
                   0.4, cv::Scalar(0, 0, 0), 1);
     }
 
-    // Draw ArUco markers + depth labels
     if (!ids.empty()) {
       cv::aruco::drawDetectedMarkers(frame, corners, ids);
-      for (size_t i = 0; i < ids.size(); i++) {
-        float u = (corners[i][0].x + corners[i][2].x) / 2.0f;
-        float v = (corners[i][0].y + corners[i][2].y) / 2.0f;
-        float z_mm = lookup_depth(depthMat, u, v);
-        float z_m = z_mm * 0.001f;
-        std::string label = "ID=" + std::to_string(ids[i]) + " Z=" + z_m + "m";
-        cv::putText(frame, label, cv::Point(u, v - 10),
+      for (size_t i = 0; i < ids.size(); ++i) {
+        const auto c = ArUcoDetector::centroid(corners[i]);
+        std::string lbl = "ID=" + std::to_string(ids[i]);
+        if (i < samples.size() && samples[i].valid) {
+          lbl += " Z=" + std::to_string(samples[i].z_m).substr(0, 4) + "m";
+        }
+        cv::putText(frame, lbl, cv::Point(c.x, c.y - 10),
                     cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 255), 1);
       }
     }
 
-    cv::namedWindow("OAKD-LR NN Output", cv::WINDOW_NORMAL);
-    cv::imshow("OAKD-LR NN Output", frame);
-
+    cv::imshow(WINDOW_NAME, frame);
     cv::waitKey(1);
   }
 
-private:
-  static constexpr std::array<const char *, 5> class_names = {
-      "red_cube", "green_cube", "blue_cube", "yellow_cube", "gray_cube"};
+  double conf_threshold_{0.6};
+  float rgb_fps_{15.0f};
+  std::string model_path_;
+  std::vector<std::string> class_names_;
 
-  std::string resolve_model_path() {
-    auto param_path = get_parameter("model_path").as_string();
-    if (!param_path.empty() && std::filesystem::exists(param_path))
-      return param_path;
-    std::vector<std::string> candidates = {
-        "/ros_ws/src/aruco_detector_cpp/models/"
-        "best_416.rvc2_legacy.rvc2.tar.xz",
-        "models/best.rvc2.tar.xz",
-    };
-    for (auto &p : candidates) {
-      if (!p.empty() && std::filesystem::exists(p))
-        return p;
-    }
-    return param_path;
-  }
-
-  bool debug_ = false;
-  float conf_threshold_ = 0.6f;
-  std::string parent_tf_ = "";
   std::shared_ptr<dai::Device> device_;
-  std::unique_ptr<dai::Pipeline> pipeline_;
-  std::shared_ptr<dai::MessageQueue> preview_queue_;
+  std::shared_ptr<dai::Pipeline> pipeline_;
   std::shared_ptr<dai::MessageQueue> detection_queue_;
+  std::shared_ptr<dai::MessageQueue> preview_queue_;
   std::shared_ptr<dai::MessageQueue> depth_queue_;
-  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-  cv::Ptr<cv::aruco::Dictionary> aruco_dict_;
-  cv::Ptr<cv::aruco::DetectorParameters> aruco_params_;
-  std::thread spinner_thread_;
-  float fx_ = 0, fy_ = 0, cx_ = 0, cy_ = 0;
-  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_cubes_;
-  rclcpp::Publisher<aruco_msgs::msg::MarkerArray>::SharedPtr pub_aruco_;
+
+  DepthaiPipeline pipeline_helper_;
+  ArUcoDetector aruco_;
+
+  float fx_{0}, fy_{0}, cx_{0}, cy_{0};
 };
 
 int main(int argc, char *argv[]) {
   rclcpp::init(argc, argv);
   try {
-    auto node = std::make_shared<CubeDetectorNode>();
-    node->setup();
-    node->spin();
+    auto node = std::make_shared<DetectorNode>();
+    node->initialise();
+    node->run();
   } catch (const std::exception &e) {
-    RCLCPP_ERROR(rclcpp::get_logger("detector_node"), "Error: %s", e.what());
+    RCLCPP_ERROR(rclcpp::get_logger("detector_node"), "error: %s", e.what());
   }
   rclcpp::shutdown();
   return 0;
